@@ -382,17 +382,15 @@ footer button{color:#ef7777!important}
 
 <div class="modal" id="modal"><div id="modal-body"></div></div>
 <div class="toast" id="toast"></div>
- <!-- This connects your backend -->
-  <script src="backend.js"></script>
-  <script>
-    showProducts();
-  </script>
+
 <script src="https://js.paystack.co/v1/inline.js"></script>
 <script>
 /* ===== CONFIG ===== */
 const PAYSTACK_PUBLIC_KEY='pk_test_6a9e7c3aafa891db78df68bdeaf7e7cdde313d02'; // Replace with your own Paystack test/live public key.
 const WHATSAPP='233500284031';
 const ADMIN_PIN='9113';   // Change this PIN in the source before sharing the admin dashboard.
+const GOOGLE_SHEETS_API='https://script.google.com/macros/s/AKfycbyU_-kKrwx6bWLXJGiqxo0ZUBqabQfZtYkNcY6ufM2GLKuebOPIbyN7gbKkRkKM_Akt/exec';
+let backendReady=false, backendLoading=false, backendLastSync=0;
 const STORE='Nexa Auto Hub';
 const CATS=['Engine','Brakes','Suspension & steering','Electrical','Filters & oils','Body & lights','Tyres & wheels','Cooling system','Transmission','Motorcycle parts'];
 const ICON={'Engine':'🔧','Brakes':'🛑','Suspension & steering':'🛞','Electrical':'🔋','Filters & oils':'🛢','Body & lights':'💡','Tyres & wheels':'🛞','Cooling system':'🌡️','Transmission':'⚙️','Motorcycle parts':'🏍️'};
@@ -403,8 +401,55 @@ const STATUSES=['New','Confirmed','Out for delivery','Delivered','Cancelled'];
 /* ===== STORAGE (browser-only; see notes) ===== */
 const store={
   get(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
-  set(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){toast('Could not save. Browser storage is full or blocked.');return false}}
+  set(k,v){
+    try{localStorage.setItem(k,JSON.stringify(v));}
+    catch(e){toast('Could not save locally. Browser storage is full or blocked.');return false}
+    if(backendReady && sessionStorage.getItem('nexa_parts_admin')==='1'){
+      const action=k==='nexa_parts_products'?'saveProducts':k==='nexa_parts_orders'?'saveOrders':null;
+      if(action) backendPost(action,{data:JSON.stringify(v)}).then(r=>{
+        if(!r || r.ok!==true) toast('Google Sheets save failed: '+((r&&r.error)||'Please check your connection'));
+      }).catch(()=>toast('Could not reach Google Sheets. Your change is saved only on this device until connection returns.'));
+    }
+    return true;
+  }
 };
+
+// Send a form-encoded request to the Google Apps Script web app.
+async function backendPost(action, fields={}){
+  const body=new URLSearchParams({action,...fields});
+  if(action==='saveProducts'||action==='saveOrders') body.set('adminPin',ADMIN_PIN);
+  const response=await fetch(GOOGLE_SHEETS_API,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body.toString()});
+  const result=await response.json();
+  if(!response.ok || result.ok===false) throw new Error(result.error||'Google Sheets request failed');
+  return result;
+}
+
+// Public product/order reads use JSONP to work with Apps Script redirects.
+function loadBackend(showMessage=false){
+  if(backendLoading) return;
+  backendLoading=true;
+  const callback='nexaSheetsCallback_'+Date.now()+'_'+Math.floor(Math.random()*10000);
+  const script=document.createElement('script');
+  let finished=false;
+  const finish=()=>{if(finished)return;finished=true;backendLoading=false;script.remove();try{delete window[callback]}catch(e){window[callback]=undefined}};
+  const timer=setTimeout(()=>{finish();if(showMessage)toast('Could not load Google Sheets. Check the Apps Script deployment.');},12000);
+  window[callback]=(data)=>{
+    clearTimeout(timer);
+    if(data && data.ok===true && Array.isArray(data.products)){
+      products=data.products;
+      orders=Array.isArray(data.orders)?data.orders:[];
+      try{localStorage.setItem('nexa_parts_products',JSON.stringify(products));localStorage.setItem('nexa_parts_orders',JSON.stringify(orders));}catch(e){}
+      backendReady=true;backendLastSync=Date.now();
+      renderShop();
+      if(sessionStorage.getItem('nexa_parts_admin')==='1' && !$('v-admin').hidden) renderAdmin();
+    } else if(showMessage) toast('Google Sheets returned an unexpected response.');
+    finish();
+  };
+  script.onerror=()=>{clearTimeout(timer);finish();if(showMessage)toast('Google Sheets connection failed.');};
+  script.src=GOOGLE_SHEETS_API+'?callback='+encodeURIComponent(callback)+'&t='+Date.now()+(sessionStorage.getItem('nexa_parts_admin')==='1'?'&adminPin='+encodeURIComponent(ADMIN_PIN):'');
+  document.head.appendChild(script);
+}
+
 const SEED=[
  {id:'p1',name:'Front brake pads',brand:'Bosch',cat:'Brakes',fit:'Toyota Corolla 2010-2018',cond:'Brand new',price:180,stock:14},
  {id:'p2',name:'Oil filter',brand:'Denso',cat:'Filters & oils',fit:'Toyota, Honda, Nissan selected models',cond:'Brand new',price:45,stock:40},
@@ -550,20 +595,27 @@ function payStack(pay){
     channels:pay==='momo'?['mobile_money']:['card'],ref:'NEXA-'+Date.now()+'-'+Math.floor(Math.random()*1e6),
     callback:r=>{toast('Payment successful');finalize(pay,r.reference)},onClose:()=>toast('Payment window closed. Order not placed.')}).openIframe();
 }
-function finalize(pay,ref=null){
+async function finalize(pay,ref=null){
   const d=new Date().toISOString().slice(0,10).replace(/-/g,'');
   const o={no:'NEXA-'+d+'-'+Math.floor(1000+Math.random()*9000),date:new Date().toISOString(),status:'New',
     name:$('f-name').value.trim(),phone:$('f-phone').value.trim(),email:$('f-email').value.trim(),region:$('f-region').value,city:$('f-city').value.trim(),
     address:$('f-addr').value.trim(),vehicle:$('f-veh').value.trim(),pay,ref,
     items:cart.map(i=>{const p=find(i.id);return{id:p.id,name:p.name,price:p.price,qty:i.qty}}),total:totals().sum};
-  cart.forEach(i=>{const p=find(i.id);p.stock-=i.qty});
-  orders.unshift(o);store.set('nexa_parts_orders',orders);store.set('nexa_parts_products',products);
-  const url='https://wa.me/'+WHATSAPP+'?text='+encodeURIComponent(waText(o));
-  $('d-name').textContent=o.name.split(' ')[0];$('d-no').textContent='Order '+o.no;
-  $('d-steps').innerHTML=`Paystack checkout completed for <b>${money(o.total)}</b> (reference ${esc(ref||'n/a')}). Our team will contact <b>${esc(o.phone)}</b> to confirm part fitment and the delivery fee before dispatch.`;
-  $('d-wa').href=url;let opened=false;try{opened=!!window.open(url,'_blank')}catch(e){}
-  $('d-hint').hidden=opened;cart=[];renderCart();$('co-main').hidden=true;$('co-done').hidden=false;window.scrollTo(0,0);
+  try{
+    toast('Verifying payment and saving your order...');
+    const result=await backendPost('placeOrder',{data:JSON.stringify(o)});
+    if(!result || result.ok!==true) throw new Error((result&&result.error)||'Order could not be saved');
+    const url='https://wa.me/'+WHATSAPP+'?text='+encodeURIComponent(waText(o));
+    $('d-name').textContent=o.name.split(' ')[0];$('d-no').textContent='Order '+o.no;
+    $('d-steps').innerHTML=`Paystack payment verified and order saved for <b>${money(o.total)}</b> (reference ${esc(ref||'n/a')}). Our team will contact <b>${esc(o.phone)}</b> to confirm part fitment and the delivery fee before dispatch.`;
+    $('d-wa').href=url;let opened=false;try{opened=!!window.open(url,'_blank')}catch(e){}
+    $('d-hint').hidden=opened;cart=[];renderCart();$('co-main').hidden=true;$('co-done').hidden=false;window.scrollTo(0,0);
+    loadBackend(false);
+  }catch(err){
+    toast('Payment was reported successful, but order saving failed: '+err.message+'. Contact Nexa Auto Hub with reference '+(ref||'unknown'));
+  }
 }
+
 function waText(o){
   const L=['*New order: '+STORE+'*','Order: '+o.no,'','*Customer*','Name: '+o.name,'Phone: '+o.phone];
   if(o.email)L.push('Email: '+o.email);
@@ -582,7 +634,7 @@ function adminLogin(){
 }
 function checkPin(){if($('pin').value===ADMIN_PIN){try{sessionStorage.setItem('nexa_parts_admin','1')}catch(e){}closeModal();openAdmin()}else{$('pin').parentElement.classList.add('bad')}}
 function adminLogout(){try{sessionStorage.removeItem('nexa_parts_admin')}catch(e){}show('shop')}
-function openAdmin(){show('admin');renderAdmin()}
+function openAdmin(){show('admin');renderAdmin();loadBackend(true)}
 function renderAdmin(){
   const tabs=[['overview','Overview'],['orders','Orders'],['products','Products']];
   $('side').innerHTML=tabs.map(([k,l])=>`<button class="${k===tab?'on':''}" onclick="tab='${k}';renderAdmin()">${l}${k==='orders'&&orders.filter(o=>o.status==='New').length?' ('+orders.filter(o=>o.status==='New').length+')':''}</button>`).join('');
@@ -664,6 +716,9 @@ function delProduct(id){
 /* ===== INIT ===== */
 renderShop();payUI();
 const footerYear=$('footer-year');if(footerYear)footerYear.textContent=new Date().getFullYear();
+// Load the shared catalogue and orders for every visitor; refresh periodically.
+loadBackend(false);
+setInterval(()=>{if(Date.now()-backendLastSync>12000)loadBackend(false)},20000);
 </script>
 </body>
 </html>
